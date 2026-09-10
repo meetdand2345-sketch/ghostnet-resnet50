@@ -1,19 +1,164 @@
-import argparse,cv2,numpy as np,torch
+import argparse
 from pathlib import Path
+
+import cv2
+import numpy as np
+import torch
+
 from src.model import build_model
 from src.preprocessing import preprocess
-from src.utils import load_threshold
+
+
 def main():
-    a=argparse.ArgumentParser(); a.add_argument('--image',required=True); a.add_argument('--weights',default='models/deeplabv3_resnet50_best.pt'); a.add_argument('--size',type=int,default=512); z=a.parse_args()
-    d=torch.device('cuda' if torch.cuda.is_available() else 'cpu'); m=build_model(False); m.load_state_dict(torch.load(z.weights,map_location=d)['model_state_dict']); m.to(d).eval()
-    orig=cv2.imread(z.image)
-    if orig is None: raise FileNotFoundError(z.image)
-    im=cv2.resize(preprocess(orig),(z.size,z.size)); rgb=cv2.cvtColor(im,cv2.COLOR_BGR2RGB).astype(np.float32)/255
-    rgb=(rgb-np.array([.485,.456,.406]))/np.array([.229,.224,.225]); x=torch.from_numpy(rgb.transpose(2,0,1)).float().unsqueeze(0).to(d)
-    with torch.no_grad(): prob=torch.sigmoid(m(x)['out'])[0,0].cpu().numpy()
-    t=load_threshold(); small=(prob>=t).astype(np.uint8)*255; mask=cv2.resize(small,(orig.shape[1],orig.shape[0]),interpolation=cv2.INTER_NEAREST)
-    masked=cv2.bitwise_and(orig,orig,mask=mask); overlay=orig.copy(); fg=mask>0; overlay[fg]=(0.55*overlay[fg]+0.45*np.array([0,0,255])).astype(np.uint8)
-    out=Path('outputs'); out.mkdir(exist_ok=True); stem=Path(z.image).stem
-    cv2.imwrite(str(out/f'mask_{stem}.png'),mask); cv2.imwrite(str(out/f'masked_{stem}.png'),masked); cv2.imwrite(str(out/f'overlay_{stem}.jpg'),overlay)
-    print('Net detected:',bool(mask.any())); print(f'Threshold: {t:.4f}'); print(f'Max probability: {prob.max():.4f}'); print(f'Top 1% probability: {np.percentile(prob,99):.4f}'); print(f'Mask area ratio: {(mask>0).mean():.4f}'); print('Saved:',out.resolve())
-if __name__=='__main__': main()
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--image", required=True)
+    parser.add_argument(
+        "--weights",
+        default="models/deeplabv3_resnet50_best.pt"
+    )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=0.5
+    )
+
+    args = parser.parse_args()
+
+    device = torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu"
+    )
+
+    print("Device:", device)
+
+    checkpoint = torch.load(
+        args.weights,
+        map_location=device
+    )
+
+    model = build_model(True)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model = model.to(device)
+    model.eval()
+
+    size = checkpoint.get("size", 512)
+
+    image = cv2.imread(args.image)
+
+    if image is None:
+        raise FileNotFoundError(
+            f"Could not read image: {args.image}"
+        )
+
+    original_h, original_w = image.shape[:2]
+
+    # Use the preprocessing function exactly as defined
+    # in src/preprocessing.py.
+    processed = preprocess(image)
+
+    # Convert to tensor and resize to the model input size.
+    if isinstance(processed, np.ndarray):
+        tensor = torch.from_numpy(processed)
+
+        if tensor.ndim == 2:
+            tensor = tensor.unsqueeze(0)
+
+        if tensor.ndim == 3 and tensor.shape[0] not in (1, 3):
+            tensor = tensor.permute(2, 0, 1)
+
+        tensor = tensor.float()
+
+        if tensor.max() > 1:
+            tensor = tensor / 255.0
+    else:
+        tensor = processed
+
+    if tensor.ndim == 3:
+        tensor = tensor.unsqueeze(0)
+
+    tensor = torch.nn.functional.interpolate(
+        tensor,
+        size=(size, size),
+        mode="bilinear",
+        align_corners=False
+    )
+
+    # DeepLabV3 expects 3 channels.
+    if tensor.shape[1] == 1:
+        tensor = tensor.repeat(1, 3, 1, 1)
+
+    tensor = tensor.to(device)
+
+    with torch.no_grad():
+        output = model(tensor)["out"]
+        probability = torch.sigmoid(output)[0, 0]
+
+    probability = probability.cpu().numpy()
+
+    mask = (
+        probability >= args.threshold
+    ).astype(np.uint8) * 255
+
+    mask = cv2.resize(
+        mask,
+        (original_w, original_h),
+        interpolation=cv2.INTER_NEAREST
+    )
+
+    probability = cv2.resize(
+        probability,
+        (original_w, original_h),
+        interpolation=cv2.INTER_LINEAR
+    )
+
+    Path("outputs").mkdir(exist_ok=True)
+
+    stem = Path(args.image).stem
+
+    mask_path = f"outputs/mask_{stem}.png"
+    masked_path = f"outputs/masked_{stem}.png"
+    overlay_path = f"outputs/overlay_{stem}.jpg"
+
+    cv2.imwrite(mask_path, mask)
+
+    masked = cv2.bitwise_and(
+        image,
+        image,
+        mask=mask
+    )
+
+    cv2.imwrite(masked_path, masked)
+
+    overlay = image.copy()
+
+    contours, _ = cv2.findContours(
+        mask,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    cv2.drawContours(
+        overlay,
+        contours,
+        -1,
+        (0, 255, 0),
+        2
+    )
+
+    cv2.imwrite(overlay_path, overlay)
+
+    max_probability = float(probability.max())
+    mask_ratio = float((mask > 0).mean())
+
+    print("Image:", args.image)
+    print("Threshold:", args.threshold)
+    print("Max probability:", round(max_probability, 4))
+    print("Mask area:", round(mask_ratio, 4))
+    print("Detected:", mask_ratio > 0)
+    print("Mask:", mask_path)
+    print("Masked:", masked_path)
+    print("Overlay:", overlay_path)
+
+
+if __name__ == "__main__":
+    main()
